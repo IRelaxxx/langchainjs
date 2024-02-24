@@ -134,8 +134,7 @@ export class Replicate extends LLM implements ReplicateInput {
       () =>
         stream
           ? replicate.predictions.create({
-              // @ts-expect-error oii
-              model: this.model,
+              version: this.model.split(":")[1],
               stream: true,
               input: {
                 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -179,18 +178,9 @@ export class Replicate extends LLM implements ReplicateInput {
     });
 
     let readableStream;
-    if (!eventStream.ok) {
+    if (eventStream.ok) {
       if (eventStream.body) {
-        const reader = eventStream.body.getReader();
-        readableStream = new ReadableStream({
-          async start(controller) {
-            const { done, value } = await reader.read();
-            if (!done) {
-              const errorText = new TextDecoder().decode(value);
-              controller.error(new Error(`Response error: ${errorText}`));
-            }
-          },
-        });
+        readableStream = eventStream.body;
       } else {
         readableStream = new ReadableStream({
           start(controller) {
@@ -209,16 +199,12 @@ export class Replicate extends LLM implements ReplicateInput {
     const stream =
       convertEventStreamToIterableReadableDataStream(readableStream);
     for await (const chunk of stream) {
-      console.log("chunk", chunk);
-      if (chunk !== "") {
-        const parsedChunk = JSON.parse(chunk);
-        const generationChunk = new GenerationChunk({
-          text: parsedChunk.response,
-        });
-        yield generationChunk;
-        // eslint-disable-next-line no-void
-        void runManager?.handleLLMNewToken(generationChunk.text ?? "");
-      }
+      const generationChunk = new GenerationChunk({
+        text: chunk,
+      });
+      yield generationChunk;
+      // eslint-disable-next-line no-void
+      void runManager?.handleLLMNewToken(generationChunk.text ?? "");
     }
   }
 
