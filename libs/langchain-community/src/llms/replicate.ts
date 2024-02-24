@@ -1,5 +1,9 @@
+import { CallbackManagerForLLMRun } from "@langchain/core/callbacks/manager";
 import { LLM, type BaseLLMParams } from "@langchain/core/language_models/llms";
+import { GenerationChunk } from "@langchain/core/outputs";
 import { getEnvironmentVariable } from "@langchain/core/utils/env";
+import { Prediction } from "replicate";
+import { convertEventStreamToIterableReadableDataStream } from "../utils/event_source_parse.js";
 
 /**
  * Interface defining the structure of the input data for the Replicate
@@ -19,6 +23,8 @@ export interface ReplicateInput {
 
   /** The key used to pass prompts to the model. */
   promptKey?: string;
+
+  streaming?: boolean;
 }
 
 /**
@@ -59,6 +65,8 @@ export class Replicate extends LLM implements ReplicateInput {
 
   promptKey?: string;
 
+  streaming = false;
+
   constructor(fields: ReplicateInput & BaseLLMParams) {
     super(fields);
 
@@ -77,6 +85,7 @@ export class Replicate extends LLM implements ReplicateInput {
     this.model = fields.model;
     this.input = fields.input ?? {};
     this.promptKey = fields.promptKey;
+    this.streaming = fields?.streaming ?? this.streaming;
   }
 
   _llmType() {
@@ -84,10 +93,11 @@ export class Replicate extends LLM implements ReplicateInput {
   }
 
   /** @ignore */
-  async _call(
+  async _request(
     prompt: string,
-    options: this["ParsedCallOptions"]
-  ): Promise<string> {
+    options: this["ParsedCallOptions"],
+    stream?: boolean
+  ): Promise<object | Prediction> {
     const imports = await Replicate.imports();
 
     const replicate = new imports.Replicate({
@@ -122,23 +132,124 @@ export class Replicate extends LLM implements ReplicateInput {
     const output = await this.caller.callWithOptions(
       { signal: options.signal },
       () =>
-        replicate.run(this.model, {
-          input: {
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-            [this.promptKey!]: prompt,
-            ...this.input,
-          },
-        })
+        stream
+          ? replicate.predictions.create({
+              // @ts-expect-error oii
+              model: this.model,
+              stream: true,
+              input: {
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                [this.promptKey!]: prompt,
+                ...this.input,
+              },
+            })
+          : replicate.run(this.model, {
+              input: {
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                [this.promptKey!]: prompt,
+                ...this.input,
+              },
+            })
     );
+    return output;
+  }
 
-    if (typeof output === "string") {
-      return output;
-    } else if (Array.isArray(output)) {
-      return output.join("");
+  async *_streamResponseChunks(
+    prompt: string,
+    options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<GenerationChunk> {
+    const response: Prediction = (await this._request(
+      prompt,
+      options,
+      true
+    )) as Prediction;
+    const url = response.urls?.stream;
+
+    if (!url) {
+      if (response.error) throw new Error(response.error);
+      else throw new Error("Missing stream URL in Replicate response");
+    }
+
+    const eventStream = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "text/event-stream",
+      },
+    });
+
+    let readableStream;
+    if (!eventStream.ok) {
+      if (eventStream.body) {
+        const reader = eventStream.body.getReader();
+        readableStream = new ReadableStream({
+          async start(controller) {
+            const { done, value } = await reader.read();
+            if (!done) {
+              const errorText = new TextDecoder().decode(value);
+              controller.error(new Error(`Response error: ${errorText}`));
+            }
+          },
+        });
+      } else {
+        readableStream = new ReadableStream({
+          start(controller) {
+            controller.error(new Error("Response error: No response body"));
+          },
+        });
+      }
     } else {
-      // Note this is a little odd, but the output format is not consistent
-      // across models, so it makes some amount of sense.
-      return String(output);
+      readableStream = new ReadableStream({
+        start(controller) {
+          controller.error(new Error("Response error: response not ok"));
+        },
+      });
+    }
+
+    const stream =
+      convertEventStreamToIterableReadableDataStream(readableStream);
+    for await (const chunk of stream) {
+      console.log("chunk", chunk);
+      if (chunk !== "") {
+        const parsedChunk = JSON.parse(chunk);
+        const generationChunk = new GenerationChunk({
+          text: parsedChunk.response,
+        });
+        yield generationChunk;
+        // eslint-disable-next-line no-void
+        void runManager?.handleLLMNewToken(generationChunk.text ?? "");
+      }
+    }
+  }
+
+  async _call(
+    prompt: string,
+    options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<string> {
+    if (!this.streaming) {
+      const response = await this._request(prompt, options, false);
+
+      if (typeof response === "string") {
+        return response;
+      } else if (Array.isArray(response)) {
+        return response.join("");
+      } else {
+        // Note this is a little odd, but the output format is not consistent
+        // across models, so it makes some amount of sense.
+        return String(response);
+      }
+    } else {
+      const stream = this._streamResponseChunks(prompt, options, runManager);
+      let finalResult: GenerationChunk | undefined;
+      for await (const chunk of stream) {
+        if (finalResult === undefined) {
+          finalResult = chunk;
+        } else {
+          finalResult = finalResult.concat(chunk);
+        }
+      }
+      return finalResult?.text ?? "";
     }
   }
 
